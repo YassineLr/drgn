@@ -11,6 +11,7 @@ For documentation of available commands and command syntax, see
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import re
 import shutil
@@ -31,6 +32,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    Set,
     Tuple,
     Union,
     overload,
@@ -199,10 +201,16 @@ def _shell_command(source: str) -> Iterator[_ParsedShellCommand]:
             else:
                 assert_never(op)
             if getattr(sys, attr) != saved[attr]:
-                getattr(sys, attr).close()
+                try:
+                    getattr(sys, attr).close()
+                except BrokenPipeError:
+                    pass
             setattr(sys, attr, open(path, mode))
 
-        yield parsed
+        try:
+            yield parsed
+        except BrokenPipeError:
+            pass
     except Exception as e:
         exceptions.append(e)
     finally:
@@ -210,6 +218,8 @@ def _shell_command(source: str) -> Iterator[_ParsedShellCommand]:
             if getattr(sys, attr) != file:
                 try:
                     getattr(sys, attr).close()
+                except BrokenPipeError:
+                    pass
                 except Exception as e:
                     exceptions.append(e)
                 setattr(sys, attr, file)
@@ -372,15 +382,17 @@ class CommandNamespace:
             if command.enabled(prog)
         )
 
-    def split_command(self, command: str) -> Tuple[str, str]:
+    def _run(self, prog: Program, command: str, *, globals: Dict[str, Any]) -> Any:
         command = command.lstrip()
         match = _SHELL_TOKEN_REGEX.match(command)
         if not match or match.lastgroup != "WORD":
             raise SyntaxError("expected command name")
 
-        name = _unquote(match.group())
+        command_name = _unquote(match.group())
         args = command[match.end() :].lstrip()
-        return name, args
+        return self.lookup(prog, command_name).run(
+            prog, command_name, args, globals=globals
+        )
 
     def run(
         self,
@@ -399,10 +411,7 @@ class CommandNamespace:
             globals = sys._getframe(1).f_globals
 
         try:
-            command_name, args = self.split_command(command)
-            return self.lookup(prog, command_name).run(
-                prog, command_name, args, globals=globals
-            )
+            return self._run(prog, command, globals=globals)
         except Exception as e:
             if onerror is None:
                 raise
@@ -1025,3 +1034,78 @@ class _CustomCommand:
             width=shutil.get_terminal_size().columns,
             indent=indent,
         )
+
+
+class DrgnCodeBuilder:
+    """
+    Helper class for generating code for :func:`drgn_argument`.
+
+    This handles joining multiple fragments of code and adding imports. Imports
+    are deduplicated, sorted, and prepended to the final output.
+    """
+
+    def __init__(self) -> None:
+        self._code: List[str] = []
+        self._imports: Dict[str, Set[str]] = collections.defaultdict(set)
+
+    def append(self, code: str) -> None:
+        """Append a code fragment to the output."""
+        if code:
+            self._code.append(code)
+
+    def add_import(self, module: str) -> None:
+        """
+        Add an import to the output.
+
+        :param modules: Module to import.
+        """
+        self._imports[module].add("")
+
+    def add_from_import(self, module: str, *names: str) -> None:
+        """
+        Add a ``from module import name1, name2, ...`` import to the output.
+
+        :param module: Module name.
+        :param names: Names to import from *module*.
+        """
+        self._imports[module].update(names)
+
+    def get(self) -> str:
+        """Get the output as a string."""
+        parts: List[str] = []
+        first_party_imports: List[str] = []
+        for module, names in sorted(self._imports.items()):
+            if module == "drgn" or module.startswith("drgn."):
+                target = first_party_imports
+            else:
+                target = parts
+
+            if "" in names:
+                names.remove("")
+                target.append(f"import {module}\n")
+
+            if names:
+                sorted_names = sorted(names)
+                line = f"from {module} import {', '.join(sorted_names)}\n"
+                # 88 (the default Black line length) + 1 for the newline.
+                if len(line) <= 89:
+                    target.append(line)
+                else:
+                    target.append(f"from {module} import (\n")
+                    for name in sorted_names:
+                        target.append(f"    {name},\n")
+                    target.append(")\n")
+
+        if parts and first_party_imports:
+            parts.append("\n")
+        parts.extend(first_party_imports)
+
+        if parts and self._code:
+            parts.append("\n\n")
+        parts.extend(self._code)
+
+        return "".join(parts)
+
+    def print(self) -> None:
+        """Write the output to standard output."""
+        sys.stdout.write(self.get())

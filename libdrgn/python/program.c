@@ -1527,24 +1527,53 @@ static PyObject *Program_find_type(Program *self, PyObject *args, PyObject *kwds
 	return DrgnType_wrap(qualified_type);
 }
 
-static DrgnObject *Program_find_object(Program *self, const char *name,
-				       struct path_arg *filename,
+static void *set_object_not_found_error(struct drgn_error *err, PyObject *name)
+{
+	_cleanup_pydecref_ PyObject *args = Py_BuildValue("(s)", err->message);
+	drgn_error_destroy(err);
+	if (!args)
+		return NULL;
+
+	_cleanup_pydecref_ PyObject *kwargs =
+		Py_BuildValue("{sO}", "name", name);
+	if (!kwargs)
+		return NULL;
+
+	_cleanup_pydecref_ PyObject *exc =
+		PyObject_Call((PyObject *)&ObjectNotFoundError_type, args,
+			      kwargs);
+	if (exc)
+		PyErr_SetObject((PyObject *)&ObjectNotFoundError_type, exc);
+	return NULL;
+}
+
+static DrgnObject *Program_find_object(Program *self, PyObject *name_obj,
+				       const char *filename,
 				       enum drgn_find_object_flags flags)
 {
 	struct drgn_error *err;
+
+	if (!PyUnicode_Check(name_obj)) {
+		PyErr_Format(PyExc_TypeError, "name must be str, not %.200s",
+			     Py_TYPE(name_obj)->tp_name);
+		return NULL;
+	}
+	const char *name = PyUnicode_AsUTF8(name_obj);
+	if (!name)
+		return NULL;
 
 	_cleanup_pydecref_ DrgnObject *ret = DrgnObject_alloc(self);
 	if (!ret)
 		return NULL;
 	bool clear = set_drgn_in_python();
-	err = drgn_program_find_object(&self->prog, name, filename->path, flags,
+	err = drgn_program_find_object(&self->prog, name, filename, flags,
 				       &ret->obj);
 	if (clear)
 		clear_drgn_in_python();
-	if (err) {
-		set_drgn_error(err);
-		return NULL;
-	}
+	if (err && err->code == DRGN_ERROR_LOOKUP)
+		return set_object_not_found_error(err, name_obj);
+	else if (err)
+		return set_drgn_error(err);
 	return_ptr(ret);
 }
 
@@ -1552,33 +1581,31 @@ static DrgnObject *Program_object(Program *self, PyObject *args,
 				  PyObject *kwds)
 {
 	static char *keywords[] = {"name", "flags", "filename", NULL};
-	const char *name;
+	PyObject *name;
 	struct enum_arg flags = {
 		.type = FindObjectFlags_class,
 		.value = DRGN_FIND_OBJECT_ANY,
 	};
 	PATH_ARG(filename, .allow_none = true);
-
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&O&:object", keywords,
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O&O&:object", keywords,
 					 &name, enum_converter, &flags,
 					 path_converter, &filename))
 		return NULL;
 
-	return Program_find_object(self, name, &filename, flags.value);
+	return Program_find_object(self, name, filename.path, flags.value);
 }
 
 static DrgnObject *Program_constant(Program *self, PyObject *args,
 				    PyObject *kwds)
 {
 	static char *keywords[] = {"name", "filename", NULL};
-	const char *name;
+	PyObject *name;
 	PATH_ARG(filename, .allow_none = true);
-
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:constant", keywords,
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O&:constant", keywords,
 					 &name, path_converter, &filename))
 		return NULL;
 
-	return Program_find_object(self, name, &filename,
+	return Program_find_object(self, name, filename.path,
 				   DRGN_FIND_OBJECT_CONSTANT);
 }
 
@@ -1586,14 +1613,13 @@ static DrgnObject *Program_function(Program *self, PyObject *args,
 				    PyObject *kwds)
 {
 	static char *keywords[] = {"name", "filename", NULL};
-	const char *name;
+	PyObject *name;
 	PATH_ARG(filename, .allow_none = true);
-
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:function", keywords,
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O&:function", keywords,
 					 &name, path_converter, &filename))
 		return NULL;
 
-	return Program_find_object(self, name, &filename,
+	return Program_find_object(self, name, filename.path,
 				   DRGN_FIND_OBJECT_FUNCTION);
 }
 
@@ -1601,14 +1627,13 @@ static DrgnObject *Program_variable(Program *self, PyObject *args,
 				    PyObject *kwds)
 {
 	static char *keywords[] = {"name", "filename", NULL};
-	const char *name;
+	PyObject *name;
 	PATH_ARG(filename, .allow_none = true);
-
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:variable", keywords,
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O&:variable", keywords,
 					 &name, path_converter, &filename))
 		return NULL;
 
-	return Program_find_object(self, name, &filename,
+	return Program_find_object(self, name, filename.path,
 				   DRGN_FIND_OBJECT_VARIABLE);
 }
 
@@ -1818,36 +1843,11 @@ static PyObject *Program__log(Program *self, PyObject *args, PyObject *kwds)
 
 static DrgnObject *Program_subscript(Program *self, PyObject *key)
 {
-	struct drgn_error *err;
-
 	if (!PyUnicode_Check(key)) {
 		PyErr_SetObject(PyExc_KeyError, key);
 		return NULL;
 	}
-
-	const char *name = PyUnicode_AsUTF8(key);
-	if (!name)
-		return NULL;
-
-	_cleanup_pydecref_ DrgnObject *ret = DrgnObject_alloc(self);
-	if (!ret)
-		return NULL;
-
-	bool clear = set_drgn_in_python();
-	err = drgn_program_find_object(&self->prog, name, NULL,
-				       DRGN_FIND_OBJECT_ANY, &ret->obj);
-	if (clear)
-		clear_drgn_in_python();
-	if (err) {
-		if (err->code == DRGN_ERROR_LOOKUP) {
-			drgn_error_destroy(err);
-			PyErr_SetObject(PyExc_KeyError, key);
-		} else {
-			set_drgn_error(err);
-		}
-		return NULL;
-	}
-	return_ptr(ret);
+	return Program_find_object(self, key, NULL, DRGN_FIND_OBJECT_ANY);
 }
 
 static int Program_contains(Program *self, PyObject *key)
@@ -1896,6 +1896,14 @@ static PyObject *Program_get_platform(Program *self, void *arg)
 		return Platform_wrap(platform);
 	else
 		Py_RETURN_NONE;
+}
+
+static PyObject *Program_get_core_dump_path(Program *self, void *arg)
+{
+	const char *path = drgn_program_core_dump_path(&self->prog);
+	if (!path)
+		Py_RETURN_NONE;
+	return PyUnicode_FromString(path);
 }
 
 static PyObject *Program_get_language(Program *self, void *arg)
@@ -2061,6 +2069,8 @@ static PyGetSetDef Program_getset[] = {
 	{"flags", (getter)Program_get_flags, NULL, drgn_Program_flags_DOC},
 	{"platform", (getter)Program_get_platform, NULL,
 	 drgn_Program_platform_DOC},
+	{"core_dump_path", (getter)Program_get_core_dump_path, NULL,
+	 drgn_Program_core_dump_path_DOC},
 	{"language", (getter)Program_get_language, (setter)Program_set_language,
 	 drgn_Program_language_DOC},
 	{"debug_info_options", (getter)Program_get_debug_info_options,

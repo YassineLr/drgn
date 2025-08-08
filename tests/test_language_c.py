@@ -401,6 +401,66 @@ class TestPrettyPrintTypeName(MockProgramTestCase):
         )
 
 
+class TestVariableDeclaration(MockProgramTestCase):
+    def assert_variable_declaration(self, type, expected):
+        self.assertEqual(type.variable_declaration("foo"), expected)
+
+    def test_int(self):
+        self.assert_variable_declaration(self.prog.int_type("int", 4, True), "int foo")
+
+    def test_pointer(self):
+        self.assert_variable_declaration(
+            self.prog.pointer_type(self.prog.int_type("int", 4, True)), "int *foo"
+        )
+
+    def test_pointer_to_pointer(self):
+        self.assert_variable_declaration(
+            self.prog.pointer_type(
+                self.prog.pointer_type(self.prog.int_type("int", 4, True))
+            ),
+            "int **foo",
+        )
+
+    def test_array(self):
+        self.assert_variable_declaration(
+            self.prog.array_type(self.prog.int_type("int", 4, True), 3), "int foo[3]"
+        )
+
+    def test_incomplete_array(self):
+        self.assert_variable_declaration(
+            self.prog.array_type(self.prog.int_type("int", 4, True)), "int foo[]"
+        )
+
+    def test_struct(self):
+        self.assert_variable_declaration(self.point_type, "struct point foo")
+
+    def test_anonymous_struct(self):
+        self.assert_variable_declaration(
+            self.prog.struct_type(
+                None,
+                8,
+                (
+                    TypeMember(self.prog.int_type("int", 4, True), "x", 0),
+                    TypeMember(self.prog.int_type("int", 4, True), "y", 32),
+                ),
+            ),
+            """\
+struct {
+	int x;
+	int y;
+} foo""",
+        )
+
+    def test_function(self):
+        self.assert_variable_declaration(
+            self.prog.function_type(
+                self.prog.int_type("unsigned int", 4, True),
+                (TypeParameter(self.prog.int_type("int", 4, True), "j"),),
+            ),
+            "unsigned int foo(int j)",
+        )
+
+
 class TestPrettyPrintType(MockProgramTestCase):
     def assertPrettyPrint(self, type, expected):
         self.assertEqual(str(type), expected)
@@ -1651,6 +1711,53 @@ class TestOperators(MockProgramTestCase):
                 SyntaxError, error, container_of, obj, type_, member_designator
             )
 
+    def test_subobject_member(self):
+        obj = Object(self.prog, self.point_type, {"x": 1, "y": 2})
+        self.assertIdentical(
+            obj.subobject_("x"),
+            Object(self.prog, self.prog.int_type("int", 4, True), 1),
+        )
+
+    def test_subobject_element(self):
+        obj = Object(
+            self.prog,
+            self.prog.array_type(self.prog.int_type("int", 4, True), 3),
+            [1, 2, 3],
+        )
+        self.assertIdentical(
+            obj.subobject_("[1]"),
+            Object(self.prog, self.prog.int_type("int", 4, True), 2),
+        )
+
+    def test_subobject_empty(self):
+        obj = Object(self.prog, self.point_type, {"x": 1, "y": 2})
+        self.assertRaisesRegex(
+            SyntaxError, r"expected identifier or '\['", obj.subobject_, ""
+        )
+        self.assertRaisesRegex(
+            SyntaxError, r"expected identifier or '\['", obj.subobject_, " "
+        )
+
+    def test_subobject_chain(self):
+        obj = Object(
+            self.prog,
+            self.prog.array_type(self.line_segment_type, 2),
+            [
+                {
+                    "a": {"x": 1, "y": 2},
+                    "b": {"x": 3, "y": 4},
+                },
+                {
+                    "a": {"x": 5, "y": 6},
+                    "b": {"x": 7, "y": 8},
+                },
+            ],
+        )
+        self.assertIdentical(
+            obj.subobject_("[1].a.y"),
+            Object(self.prog, self.prog.int_type("int", 4, True), 6),
+        )
+
 
 class TestImplicitConvert(MockProgramTestCase):
     def test_to_bool(self):
@@ -2422,6 +2529,79 @@ class TestPrettyPrintObject(MockProgramTestCase):
             str(Object(self.prog, "const int", value=-99)), "(const int)-99"
         )
 
+    def test_int_decimal(self):
+        self.assertEqual(
+            Object(self.prog, "int", 0).format_(type_name=False, integer_base=10), "0"
+        )
+        self.assertEqual(
+            Object(self.prog, "unsigned int", 0).format_(
+                type_name=False, integer_base=10
+            ),
+            "0",
+        )
+        self.assertEqual(
+            Object(self.prog, "int", 13).format_(type_name=False, integer_base=10), "13"
+        )
+        self.assertEqual(
+            Object(self.prog, "unsigned int", 13).format_(
+                type_name=False, integer_base=10
+            ),
+            "13",
+        )
+        self.assertEqual(
+            Object(self.prog, "int", -13).format_(type_name=False, integer_base=10),
+            "-13",
+        )
+
+    def test_int_hex(self):
+        self.assertEqual(
+            Object(self.prog, "int", 0).format_(type_name=False, integer_base=16), "0x0"
+        )
+        self.assertEqual(
+            Object(self.prog, "unsigned int", 0).format_(
+                type_name=False, integer_base=16
+            ),
+            "0x0",
+        )
+        self.assertEqual(
+            Object(self.prog, "int", 13).format_(type_name=False, integer_base=16),
+            "0xd",
+        )
+        self.assertEqual(
+            Object(self.prog, "unsigned int", 13).format_(
+                type_name=False, integer_base=16
+            ),
+            "0xd",
+        )
+        self.assertEqual(
+            Object(self.prog, "int", -13).format_(type_name=False, integer_base=16),
+            "-0xd",
+        )
+
+    def test_int_oct(self):
+        self.assertEqual(
+            Object(self.prog, "int", 0).format_(type_name=False, integer_base=8), "0"
+        )
+        self.assertEqual(
+            Object(self.prog, "unsigned int", 0).format_(
+                type_name=False, integer_base=8
+            ),
+            "0",
+        )
+        self.assertEqual(
+            Object(self.prog, "int", 13).format_(type_name=False, integer_base=8), "015"
+        )
+        self.assertEqual(
+            Object(self.prog, "unsigned int", 13).format_(
+                type_name=False, integer_base=8
+            ),
+            "015",
+        )
+        self.assertEqual(
+            Object(self.prog, "int", -13).format_(type_name=False, integer_base=8),
+            "-015",
+        )
+
     def test_char(self):
         obj = Object(self.prog, "char", value=65)
         self.assertEqual(str(obj), "(char)65")
@@ -3185,3 +3365,26 @@ class TestPrettyPrintObject(MockProgramTestCase):
 	.a = (__uint128_t)0xdeadbeef,
 }""",
         )
+
+    def test_integer_base_struct(self):
+        self.assertEqual(
+            Object(self.prog, self.point_type, {"x": 0, "y": 13}).format_(
+                integer_base=16
+            ),
+            """\
+(struct point){
+	.x = (int)0x0,
+	.y = (int)0xd,
+}""",
+        )
+
+    def test_integer_base_array(self):
+        self.assertEqual(
+            Object(self.prog, "int [2]", [0, 13]).format_(integer_base=16),
+            "(int [2]){ 0x0, 0xd }",
+        )
+
+    def test_integer_base_dereference(self):
+        self.add_memory_segment((13).to_bytes(4, "little"), virt_addr=0xFFFF0000)
+        obj = Object(self.prog, "int *", value=0xFFFF0000)
+        self.assertEqual(obj.format_(integer_base=8), "*(int *)0xffff0000 = 015")

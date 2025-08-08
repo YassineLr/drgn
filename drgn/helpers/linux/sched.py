@@ -20,6 +20,7 @@ from _drgn import (
 )
 from drgn import IntegerLike, Object, Program
 from drgn.helpers.common.prog import takes_program_or_default
+from drgn.helpers.linux.percpu import per_cpu
 
 __all__ = (
     "cpu_curr",
@@ -163,3 +164,43 @@ def loadavg(prog: Program) -> Tuple[float, float, float]:
     avenrun = prog["avenrun"]
     vals = [avenrun[i].value_() / (1 << 11) for i in range(3)]
     return (vals[0], vals[1], vals[2])
+
+
+@takes_program_or_default
+def cpu_rq(prog: Program, cpu: IntegerLike) -> Object:
+    """
+    Get the runqueue for a given cpu.
+
+    :param cpu: CPU number.
+    :returns: ``struct rq``
+    """
+    return per_cpu(prog["runqueues"], cpu)
+
+
+def task_rq(task: Object) -> Object:
+    """
+    Get the runqueue for a given task.
+
+    :param task: ``struct task_struct *``
+    :returns: ``struct rq``
+    """
+    return cpu_rq(task.prog_, task_cpu(task))
+
+
+def task_since_last_arrival_ns(task: Object) -> int:
+    """
+    Get the number of nanoseconds since a task last started running.
+
+    Assuming that time slices are short, this is approximately the time that
+    the task has been in its current status (running, queued, or blocked).
+
+    This is only supported if the kernel was compiled with
+    ``CONFIG_SCHEDSTATS`` or ``CONFIG_TASK_DELAY_ACCT``.
+
+    :param task: ``struct task_struct *``
+    :returns: Duration in nanoseconds.
+    """
+    arrival_time = task.sched_info.last_arrival.value_()
+    rq_clock = task_rq(task).clock.value_()
+
+    return rq_clock - arrival_time

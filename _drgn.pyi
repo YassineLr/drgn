@@ -98,6 +98,12 @@ class Program:
     determined yet.
     """
 
+    core_dump_path: Optional[str]
+    """
+    Path of the core dump that this program was created from, or ``None`` if it
+    was not created from a core dump.
+    """
+
     language: Language
     """
     Default programming language of the program.
@@ -117,9 +123,7 @@ class Program:
         Implement ``self[name]``. Get the object (variable, constant, or
         function) with the given name.
 
-        This is equivalent to ``prog.object(name)`` except that this raises
-        :exc:`KeyError` instead of :exc:`LookupError` if no objects with the
-        given name are found.
+        This is equivalent to ``prog.object(name)``.
 
         If there are multiple objects with the same name, one is returned
         arbitrarily. In this case, the :meth:`variable()`, :meth:`constant()`,
@@ -154,8 +158,8 @@ class Program:
         :param name: The variable name.
         :param filename: The source code file that contains the definition. See
             :ref:`api-filenames`.
-        :raises LookupError: if no variables with the given name are found in
-            the given file
+        :raises ObjectNotFoundError: if no variables with the given name are
+            found in the given file
         """
         ...
 
@@ -176,8 +180,8 @@ class Program:
         :param name: The constant name.
         :param filename: The source code file that contains the definition. See
             :ref:`api-filenames`.
-        :raises LookupError: if no constants with the given name are found in
-            the given file
+        :raises ObjectNotFoundError: if no constants with the given name are
+            found in the given file
         """
         ...
 
@@ -194,8 +198,8 @@ class Program:
         :param name: The function name.
         :param filename: The source code file that contains the definition. See
             :ref:`api-filenames`.
-        :raises LookupError: if no functions with the given name are found in
-            the given file
+        :raises ObjectNotFoundError: if no functions with the given name are
+            found in the given file
         """
         ...
 
@@ -216,8 +220,8 @@ class Program:
         :param flags: Flags indicating what kind of object to look for.
         :param filename: The source code file that contains the definition. See
             :ref:`api-filenames`.
-        :raises LookupError: if no objects with the given name are found in
-            the given file
+        :raises ObjectNotFoundError: if no objects with the given name are
+            found in the given file
         """
         ...
 
@@ -1345,6 +1349,13 @@ class FindObjectFlags(enum.Flag):
     ANY = ...
     ""
 
+class ObjectNotFoundError(KeyError):
+    def __init__(self, *args: object, name: str) -> None:
+        """Error raised when an object is not found in a program."""
+        ...
+    name: str
+    """Object name that was not found."""
+
 class DebugInfoOptions:
     """
     Options for debugging information searches.
@@ -2344,11 +2355,14 @@ class Object:
         """
         ...
 
-    def __getitem__(self, idx: IntegerLike) -> Object:
+    @overload
+    def __getitem__(self, /, i: IntegerLike) -> Object:
         """
-        Implement ``self[idx]``. Get the array element at the given index.
+        Implement ``self[i]``. Get the array element at the given index.
 
-        >>> print(prog['init_task'].comm[1])
+        This is only valid for pointers and arrays.
+
+        >>> print(prog["init_task"].comm[1])
         (char)119
 
         ``[0]`` is also the equivalent of the pointer dereference (``*``)
@@ -2359,24 +2373,83 @@ class Object:
         >>> print(ptr_to_ptr[0])
         (void *)0xffff9b86801e2460
 
-        This is only valid for pointers and arrays.
-
         .. note::
 
-            Negative indices behave as they would in the object's language (as
-            opposed to the Python semantics of indexing from the end of the
-            array).
+            Negative indices are relative to the start of the pointer/array
+            (like in C), not relative to the end (like for Python lists).
 
-        :param idx: The array index.
+            >>> ptr[-2].address_of_() == ptr - 2
+            True
+
+        :param i: Index.
         :raises TypeError: if this object is not a pointer or array
         """
         ...
+
+    @overload
+    def __getitem__(self, /, s: slice) -> Object:
+        """
+        Implement ``self[start:stop]``. Get an array :term:`slice`.
+
+        This is only valid for pointers and arrays. It creates a new array for
+        the range of elements from the (inclusive) start index to the
+        (exclusive) stop index. The length of the resulting array is therefore
+        the stop index minus the start index, or zero if the stop index is less
+        than the start index.
+
+        If the start index is omitted, it defaults to 0. If the stop index is
+        omitted, it defaults to the length of the array (in which case the
+        object must be a complete array).
+
+        For example, this can be used to get a subset of an array:
+
+        >>> prog["init_task"].comm[1:3]
+        (char [2])"wa"
+
+        Or to get a complete array from a pointer/incomplete array with a
+        separate length:
+
+        >>> poll_list
+        *(struct poll_list *)0xffffa3d3c126fa70 = {
+                .next = (struct poll_list *)0x0,
+                .len = (unsigned int)2,
+                .entries = (struct pollfd []){},
+        }
+        >>> poll_list.entries[:poll_list.len]
+        (struct pollfd [2]){
+                {
+                        .fd = (int)6,
+                        .events = (short)1,
+                        .revents = (short)0,
+                },
+                {
+                        .fd = (int)14,
+                        .events = (short)1,
+                        .revents = (short)0,
+                },
+        }
+
+        .. note::
+
+            Negative indices are relative to the start of the pointer/array
+            (like in C), not relative to the end (like for Python lists).
+
+            >>> prog['init_task'].comm[-2:]
+            (char [18])""
+            >>> prog['init_task'].comm[:-2]
+            (char [0]){}
+
+        :param s: Slice.
+        :raises TypeError: if this object is not a pointer or array
+        :raises TypeError: if the stop index is omitted and this object is not
+            an array with complete type
+        """
 
     def __len__(self) -> int:
         """
         Implement ``len(self)``. Get the number of elements in this object.
 
-        >>> len(prog['init_task'].comm)
+        >>> len(prog["init_task"].comm)
         16
 
         This is only valid for arrays.
@@ -2453,6 +2526,24 @@ class Object:
         """
         ...
 
+    def subobject_(self, designator: str) -> Object:
+        """
+        Get a subobject (member or element) of this object.
+
+        Usually, a combination of the :meth:`. <__getattr__>` and :meth:`[]
+        <.__getitem__>` operators can be used instead, but this can be used as:
+
+        1. A variant of :meth:`member_()` that doesn't automatically
+           dereference pointers.
+        2. A generalization of :func:`offsetof()`.
+
+        >>> prog["init_task"].subobject_("comm[0]") == prog["init_task"].comm[0]
+        True
+
+        :param designator: One or more member references or array subscripts.
+        """
+        ...
+
     def address_of_(self) -> Object:
         """
         Get a pointer to this object.
@@ -2520,6 +2611,7 @@ class Object:
         self,
         *,
         columns: Optional[IntegerLike] = None,
+        integer_base: Optional[IntegerLike] = None,
         dereference: Optional[bool] = None,
         symbolize: Optional[bool] = None,
         string: Optional[bool] = None,
@@ -2556,6 +2648,8 @@ class Object:
 
         :param columns: Number of columns to limit output to when the
             expression can be reasonably wrapped. Defaults to no limit.
+        :param integer_base: Base to format integers in (8, 10, or 16).
+            Defaults to 10.
         :param dereference: If this object is a pointer, include the
             dereferenced value. This does not apply to structure, union, or
             class members, or array elements, as dereferencing those could lead
@@ -3216,6 +3310,17 @@ class Type:
     def type_name(self) -> str:
         """Get a descriptive full name of this type."""
         ...
+
+    def variable_declaration(self, name: str) -> str:
+        """
+        Format a variable declaration with this type.
+
+        >>> prog.type("int [4]").variable_declaration("my_array")
+        'int my_array[4]'
+
+        :param name: Name of the variable.
+        :return: Variable declaration in programming language syntax.
+        """
 
     def is_complete(self) -> bool:
         """

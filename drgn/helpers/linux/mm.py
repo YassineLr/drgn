@@ -1504,9 +1504,7 @@ def get_task_rss_info(prog: Program, task: Object) -> TaskRss:
         filerss = percpu_counter_sum(rss_stat[MM_FILEPAGES].address_of_())
         anonrss = percpu_counter_sum(rss_stat[MM_ANONPAGES].address_of_())
         swapents = percpu_counter_sum(rss_stat[MM_SWAPENTS].address_of_())
-        shmemrss = 0
-        if MM_SHMEMPAGES >= 0:
-            shmemrss = percpu_counter_sum(rss_stat[MM_SHMEMPAGES].address_of_())
+        shmemrss = percpu_counter_sum(rss_stat[MM_SHMEMPAGES].address_of_())
     else:
         # Prior to this, the "rss_stat" was a structure containing counters that
         # were cached on each task_struct and periodically updated into the
@@ -1515,15 +1513,22 @@ def get_task_rss_info(prog: Program, task: Object) -> TaskRss:
         filerss = rss_stat.count[MM_FILEPAGES].counter.value_()
         anonrss = rss_stat.count[MM_ANONPAGES].counter.value_()
         swapents = rss_stat.count[MM_SWAPENTS].counter.value_()
+        shmemrss = 0
         if MM_SHMEMPAGES >= 0:
             shmemrss = rss_stat.count[MM_SHMEMPAGES].counter.value_()
 
         for gtask in for_each_task_in_group(task, include_self=True):
-            filerss += gtask.rss_stat.count[MM_FILEPAGES].value_()
-            anonrss += gtask.rss_stat.count[MM_ANONPAGES].value_()
-            swapents += gtask.rss_stat.count[MM_SWAPENTS].value_()
+            # Kernel configurations with a small NR_CPUS don't have the
+            # per-thread cache.
+            try:
+                rss_stat = gtask.rss_stat
+            except AttributeError:
+                break
+            filerss += rss_stat.count[MM_FILEPAGES].value_()
+            anonrss += rss_stat.count[MM_ANONPAGES].value_()
+            swapents += rss_stat.count[MM_SWAPENTS].value_()
             if MM_SHMEMPAGES >= 0:
-                shmemrss += gtask.rss_stat.count[MM_SHMEMPAGES].value_()
+                shmemrss += rss_stat.count[MM_SHMEMPAGES].value_()
 
     return TaskRss(filerss, anonrss, shmemrss, swapents)
 

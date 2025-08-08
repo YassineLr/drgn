@@ -4,7 +4,6 @@
 """Crash commands related to the current context."""
 
 import argparse
-import sys
 from typing import Any, Callable, NamedTuple, Optional
 
 from drgn import Object, Program
@@ -15,26 +14,17 @@ from drgn.commands import (
     drgn_argument,
     mutually_exclusive_group,
 )
+from drgn.commands._builtin.crash.system import _SysPrinter
 from drgn.commands.crash import (
-    _add_crash_cpu_context,
-    _add_crash_panic_context,
+    CrashDrgnCodeBuilder,
     _crash_get_panic_context,
     _find_pager,
     _get_pager,
     _pid_or_task,
-    add_crash_context,
     crash_command,
     crash_get_context,
 )
-from drgn.helpers.common.format import CellFormat, escape_ascii_string, print_table
-from drgn.helpers.linux.panic import panic_task
-from drgn.helpers.linux.sched import (
-    cpu_curr,
-    get_task_state,
-    task_cpu,
-    task_on_cpu,
-    task_thread_info,
-)
+from drgn.helpers.linux.sched import cpu_curr
 
 
 def _show_scroll_option(prog: Program) -> None:
@@ -66,6 +56,36 @@ def _set_scroll_option(prog: Program, value: str) -> None:
         prog.config["crash_pager"] = pager
 
 
+def _show_radix_option(prog: Program) -> None:
+    radix = prog.config.get("crash_radix", 10)
+    print(f"output radix: {radix} ({'hex' if radix == 16 else 'decimal'})")
+
+
+_RADICES = {
+    # Crash allows anything starting with "dec", "ten", "hex", or "six". We are
+    # stricter.
+    "10": 10,
+    "dec": 10,
+    "decimal": 10,
+    "ten": 10,
+    "16": 16,
+    "hex": 16,
+    "hexadecimal": 16,
+    "sixteen": 16,
+}
+
+
+def _validate_radix_option(value: str) -> None:
+    if value not in _RADICES:
+        raise CommandArgumentError(
+            f"set: error: invalid value for radix: {value!r} (must be 10 or 16)"
+        )
+
+
+def _set_radix_option(prog: Program, value: str) -> None:
+    prog.config["crash_radix"] = _RADICES[value]
+
+
 class _CrashOption(NamedTuple):
     show: Callable[[Program], None]
     validate: Callable[[str], None]
@@ -75,6 +95,9 @@ class _CrashOption(NamedTuple):
 _OPTIONS = {
     "scroll": _CrashOption(
         _show_scroll_option, _validate_scroll_option, _set_scroll_option
+    ),
+    "radix": _CrashOption(
+        _show_radix_option, _validate_radix_option, _set_radix_option
     ),
 }
 
@@ -94,6 +117,8 @@ _OPTIONS = {
     * ``scroll on | off``: enable (the default) or disable scrolling of long output.
 
     * ``scroll less | more``: set the pager program. The default is ``less``.
+
+    * ``radix 10 | 16``: set the default integer output base. The default is 10.
     """,
     usage=r"**set** [*pid* | *task* | **-p** | **-c** *CPU* | *option* [*value*]] [**\-\-drgn**]",
     arguments=(
@@ -180,33 +205,19 @@ def _crash_cmd_set(
 
     if args.drgn:
         if args.panic:
-            source = _add_crash_panic_context(prog, "")
+            code = CrashDrgnCodeBuilder(prog)
+            code._append_crash_panic_context()
+            code.print()
         elif args.cpu is not None:
-            source = _add_crash_cpu_context("", args.cpu)
+            code = CrashDrgnCodeBuilder(prog)
+            code._append_crash_cpu_context(args.cpu)
+            code.print()
+        elif args.task is not None:
+            code = CrashDrgnCodeBuilder(prog)
+            code.append_crash_context(args.task)
+            code.print()
         else:
-            if args.task is None:
-                source = """\
-from drgn.helpers.linux.panic import panic_task
-from drgn.helpers.linux.sched import (
-    get_task_state,
-    task_cpu,
-    task_on_cpu,
-    task_thread_info,
-)
-
-
-pid = task.pid
-comm = task.comm
-thread_info = task_thread_info(task)
-cpu = task_cpu(task)
-state = get_task_state(task)  # See also task_state_to_char(task)
-active = task_on_cpu(task)  # Is the task running on a CPU?
-panic = task == panic_task()  # Is this the task that panicked?
-"""
-            else:
-                source = ""
-            source = add_crash_context(prog, source, args.task)
-        sys.stdout.write(source)
+            _SysPrinter(prog, True, system_fields=False, context="current").print()
         return None
 
     if args.panic:
@@ -219,34 +230,8 @@ panic = task == panic_task()  # Is this the task that panicked?
         task = crash_get_context(prog, args.task)
         prog.config["crash_context_origin"] = args.task
     else:
-        task = crash_get_context(prog)
-        state = get_task_state(task)
-        if task == panic_task(prog):
-            state += " (PANIC)"
-        elif task_on_cpu(task):
-            state += " (ACTIVE)"
-        print_table(
-            [
-                (CellFormat("PID", ">"), CellFormat(task.pid.value_(), "<")),
-                (
-                    CellFormat("COMMAND", ">"),
-                    '"'
-                    + escape_ascii_string(
-                        task.comm.string_(),
-                        escape_double_quote=True,
-                        escape_backslash=True,
-                    )
-                    + '"',
-                ),
-                (
-                    CellFormat("TASK", ">"),
-                    f"{task.value_():x}  [THREAD_INFO: {task_thread_info(task).value_()}]",
-                ),
-                (CellFormat("CPU", ">"), CellFormat(task_cpu(task), "<")),
-                (CellFormat("STATE", ">"), state),
-            ],
-            sep=": ",
-        )
-        return task
+        printer = _SysPrinter(prog, False, system_fields=False, context="current")
+        printer.print()
+        return printer.task
     prog.config["crash_context"] = task
     return task

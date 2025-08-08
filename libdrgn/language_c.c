@@ -575,9 +575,28 @@ c_format_type(struct drgn_qualified_type qualified_type, char **ret)
 }
 
 static struct drgn_error *
+c_format_variable_declaration(struct drgn_qualified_type qualified_type,
+			      const char *name, char **ret)
+{
+	struct drgn_error *err;
+	STRING_BUILDER(sb);
+	struct string_callback name_callback = {
+		.fn = c_variable_name,
+		.arg = (char *)name,
+	};
+	err = c_declare_variable(qualified_type, &name_callback, 0, true, &sb);
+	if (err)
+		return err;
+	if (!string_builder_null_terminate(&sb))
+		return &drgn_enomem;
+	*ret = string_builder_steal(&sb);
+	return NULL;
+}
+
+static struct drgn_error *
 c_format_object_impl(const struct drgn_object *obj, size_t indent,
 		     size_t one_line_columns, size_t multi_line_columns,
-		     enum drgn_format_object_flags flags,
+		     const struct drgn_format_object_options *options,
 		     struct string_builder *sb);
 
 static bool is_character_type(struct drgn_type *type)
@@ -678,12 +697,13 @@ c_format_string(struct drgn_program *prog, uint64_t address, uint64_t length,
 
 static struct drgn_error *
 c_format_int_object(const struct drgn_object *obj,
-		    enum drgn_format_object_flags flags,
+		    const struct drgn_format_object_options *options,
 		    struct string_builder *sb)
 {
 	struct drgn_error *err;
 
-	if ((flags & DRGN_FORMAT_OBJECT_CHAR) && is_character_type(obj->type)) {
+	if ((options->flags & DRGN_FORMAT_OBJECT_CHAR)
+	    && is_character_type(obj->type)) {
 		union drgn_value value;
 
 		if (!string_builder_appendc(sb, '\''))
@@ -706,17 +726,64 @@ c_format_int_object(const struct drgn_object *obj,
 		return err;
 	switch (obj->encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED:
-		if (!string_builder_appendf(sb, "%" PRId64, value->svalue)) {
+		switch (options->integer_base) {
+		case 10:
+			if (!string_builder_appendf(sb, "%" PRId64,
+						    value->svalue)) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			break;
+		case 16:
+			if (!string_builder_appendf(sb, "%s0x%" PRIx64,
+						    value->svalue < 0
+						    ? "-" : "",
+						    value->svalue < 0
+						    // Casting before negating
+						    // is necessary to handle
+						    // INT64_MIN.
+						    ? -(uint64_t)value->svalue
+						    : (uint64_t)value->svalue)) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			break;
+		case 8:
+			if (!string_builder_appendf(sb, "%s%#" PRIo64,
+						    value->svalue < 0
+						    ? "-" : "",
+						    value->svalue < 0
+						    ? -(uint64_t)value->svalue
+						    : (uint64_t)value->svalue)) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			break;
+		default:
+			UNREACHABLE();
+		}
+		break;
+	case DRGN_OBJECT_ENCODING_UNSIGNED: {
+		const char *format;
+		switch (options->integer_base) {
+		case 10:
+			format = "%" PRIu64;
+			break;
+		case 16:
+			format = "0x%" PRIx64;
+			break;
+		case 8:
+			format = "%#" PRIo64;
+			break;
+		default:
+			UNREACHABLE();
+		}
+		if (!string_builder_appendf(sb, format, value->uvalue)) {
 			err = &drgn_enomem;
 			goto out;
 		}
 		break;
-	case DRGN_OBJECT_ENCODING_UNSIGNED:
-		if (!string_builder_appendf(sb, "%" PRIu64, value->uvalue)) {
-			err = &drgn_enomem;
-			goto out;
-		}
-		break;
+	}
 	case DRGN_OBJECT_ENCODING_SIGNED_BIG:
 	case DRGN_OBJECT_ENCODING_UNSIGNED_BIG: {
 		if (!string_builder_append(sb, "0x")) {
@@ -792,23 +859,20 @@ static struct drgn_error drgn_line_wrap = {
 
 struct initializer_iter {
 	struct drgn_error *(*next)(struct initializer_iter *,
-				   struct drgn_object *,
-				   enum drgn_format_object_flags *);
+				   struct drgn_object *);
 	void (*reset)(struct initializer_iter *);
 	struct drgn_error *(*append_designation)(struct initializer_iter *,
 						 struct string_builder *);
 };
 
-static struct drgn_error *c_format_initializer(struct drgn_program *prog,
-					       struct initializer_iter *iter,
-					       size_t indent,
-					       size_t one_line_columns,
-					       size_t multi_line_columns,
-					       bool same_line,
-					       struct string_builder *sb)
+static struct drgn_error *
+c_format_initializer(struct drgn_program *prog, struct initializer_iter *iter,
+		     size_t indent, size_t one_line_columns,
+		     size_t multi_line_columns,
+		     const struct drgn_format_object_options *options,
+		     bool same_line, struct string_builder *sb)
 {
 	struct drgn_error *err;
-	enum drgn_format_object_flags initializer_flags;
 	size_t brace, remaining_columns, start_columns;
 
 	DRGN_OBJECT(obj, prog);
@@ -822,7 +886,7 @@ static struct drgn_error *c_format_initializer(struct drgn_program *prog,
 	for (;;) {
 		size_t initializer_start;
 
-		err = iter->next(iter, &obj, &initializer_flags);
+		err = iter->next(iter, &obj);
 		if (err == &drgn_stop)
 			break;
 		else if (err)
@@ -873,8 +937,8 @@ static struct drgn_error *c_format_initializer(struct drgn_program *prog,
 
 		initializer_start = sb->len;
 		err = c_format_object_impl(&obj, indent + 1,
-					   remaining_columns - 2, 0,
-					   initializer_flags, sb);
+					   remaining_columns - 2, 0, options,
+					   sb);
 		if (err == &drgn_line_wrap)
 			break;
 		else if (err)
@@ -920,7 +984,7 @@ static struct drgn_error *c_format_initializer(struct drgn_program *prog,
 	for (;;) {
 		size_t newline, designation_start, line_columns;
 
-		err = iter->next(iter, &obj, &initializer_flags);
+		err = iter->next(iter, &obj);
 		if (err == &drgn_stop)
 			break;
 		else if (err)
@@ -946,8 +1010,8 @@ static struct drgn_error *c_format_initializer(struct drgn_program *prog,
 		if (line_columns > 1) {
 			size_t initializer_start = sb->len;
 
-			err = c_format_object_impl(&obj, 0, line_columns - 1,
-						   0, initializer_flags, sb);
+			err = c_format_object_impl(&obj, 0, line_columns - 1, 0,
+						   options, sb);
 			if (!err) {
 				size_t len = sb->len - designation_start;
 
@@ -982,8 +1046,7 @@ static struct drgn_error *c_format_initializer(struct drgn_program *prog,
 		}
 
 		err = c_format_object_impl(&obj, indent + 1, 0,
-					   multi_line_columns,
-					   initializer_flags, sb);
+					   multi_line_columns, options, sb);
 		if (err)
 			return err;
 		if (!string_builder_appendc(sb, ','))
@@ -1008,13 +1071,12 @@ struct compound_initializer_iter {
 	struct initializer_iter iter;
 	const struct drgn_object *obj;
 	struct compound_initializer_stack stack;
-	enum drgn_format_object_flags flags, member_flags;
+	enum drgn_format_object_flags flags;
 };
 
 static struct drgn_error *
 compound_initializer_iter_next(struct initializer_iter *iter_,
-			       struct drgn_object *obj_ret,
-			       enum drgn_format_object_flags *flags_ret)
+			       struct drgn_object *ret)
 {
 	struct drgn_error *err;
 	struct compound_initializer_iter *iter =
@@ -1049,8 +1111,7 @@ compound_initializer_iter_next(struct initializer_iter *iter_,
 		if (member->name ||
 		    !(iter->flags & DRGN_FORMAT_OBJECT_MEMBER_NAMES) ||
 		    !drgn_type_has_members(member_type.type)) {
-			err = drgn_object_fragment(obj_ret, iter->obj,
-						   member_type,
+			err = drgn_object_fragment(ret, iter->obj, member_type,
 						   bit_offset + member->bit_offset,
 						   member_bit_field_size);
 			if (err)
@@ -1062,7 +1123,7 @@ compound_initializer_iter_next(struct initializer_iter *iter_,
 			     DRGN_FORMAT_OBJECT_MEMBER_NAMES) {
 				bool zero;
 
-				err = drgn_object_is_zero(obj_ret, &zero);
+				err = drgn_object_is_zero(ret, &zero);
 				if (err)
 					return err;
 				if (zero)
@@ -1079,8 +1140,6 @@ compound_initializer_iter_next(struct initializer_iter *iter_,
 		new->end = new->member + drgn_type_num_members(member_type.type);
 		new->bit_offset = bit_offset + member->bit_offset;
 	}
-
-	*flags_ret = iter->member_flags;
 	return NULL;
 }
 
@@ -1112,7 +1171,7 @@ static struct drgn_error *
 c_format_compound_object(const struct drgn_object *obj,
 			 struct drgn_type *underlying_type, size_t indent,
 			 size_t one_line_columns, size_t multi_line_columns,
-			 enum drgn_format_object_flags flags,
+			 const struct drgn_format_object_options *options,
 			 struct string_builder *sb)
 {
 	struct drgn_error *err;
@@ -1143,13 +1202,12 @@ c_format_compound_object(const struct drgn_object *obj,
 			.next = compound_initializer_iter_next,
 			.reset = compound_initializer_iter_reset,
 			.append_designation =
-				flags & DRGN_FORMAT_OBJECT_MEMBER_NAMES ?
+				options->flags & DRGN_FORMAT_OBJECT_MEMBER_NAMES ?
 				compound_initializer_append_designation : NULL,
 		},
 		.obj = obj,
 		.stack = VECTOR_INIT,
-		.flags = flags,
-		.member_flags = drgn_member_format_object_flags(flags),
+		.flags = options->flags,
 	};
 	struct compound_initializer_state *new =
 		compound_initializer_stack_append_entry(&iter.stack);
@@ -1167,9 +1225,9 @@ c_format_compound_object(const struct drgn_object *obj,
 	 * including member names, then we'll skip past zero members as we
 	 * iterate, so we don't need to do this.
 	 */
-	if (!(flags & (DRGN_FORMAT_OBJECT_MEMBER_NAMES |
-		       DRGN_FORMAT_OBJECT_IMPLICIT_MEMBERS)) &&
-	    new->member < new->end) {
+	if (!(options->flags & (DRGN_FORMAT_OBJECT_MEMBER_NAMES
+				| DRGN_FORMAT_OBJECT_IMPLICIT_MEMBERS))
+	    && new->member < new->end) {
 		DRGN_OBJECT(member, drgn_object_program(obj));
 		do {
 			struct drgn_qualified_type member_type;
@@ -1196,9 +1254,13 @@ c_format_compound_object(const struct drgn_object *obj,
 		} while (new->member < new->end);
 	}
 
+	struct drgn_format_object_options initializer_options = *options;
+	initializer_options.flags =
+		drgn_member_format_object_flags(initializer_options.flags);
 	err = c_format_initializer(drgn_object_program(obj), &iter.iter, indent,
 				   one_line_columns, multi_line_columns,
-				   flags & DRGN_FORMAT_OBJECT_MEMBERS_SAME_LINE,
+				   &initializer_options,
+				   options->flags & DRGN_FORMAT_OBJECT_MEMBERS_SAME_LINE,
 				   sb);
 out:
 	compound_initializer_stack_deinit(&iter.stack);
@@ -1260,18 +1322,15 @@ c_format_enum_object(const struct drgn_object *obj,
 
 static struct drgn_error *
 c_format_pointer_object(const struct drgn_object *obj,
-			struct drgn_type *underlying_type,
-			size_t indent, size_t one_line_columns,
-			size_t multi_line_columns,
-			enum drgn_format_object_flags flags,
+			struct drgn_type *underlying_type, size_t indent,
+			size_t one_line_columns, size_t multi_line_columns,
+			const struct drgn_format_object_options *options,
 			struct string_builder *sb)
 {
 	struct drgn_error *err;
-	enum drgn_format_object_flags passthrough_flags =
-		drgn_passthrough_format_object_flags(flags);
-	bool dereference = flags & DRGN_FORMAT_OBJECT_DEREFERENCE;
+	bool dereference = options->flags & DRGN_FORMAT_OBJECT_DEREFERENCE;
 	bool c_string =
-		((flags & DRGN_FORMAT_OBJECT_STRING) &&
+		((options->flags & DRGN_FORMAT_OBJECT_STRING) &&
 		 is_character_type(drgn_type_type(underlying_type).type));
 	uint64_t uvalue;
 	_cleanup_symbol_ struct drgn_symbol *sym = NULL;
@@ -1281,7 +1340,7 @@ c_format_pointer_object(const struct drgn_object *obj,
 	if (dereference && !c_string && !string_builder_appendc(sb, '*'))
 		return &drgn_enomem;
 	type_start = sb->len;
-	if (flags & DRGN_FORMAT_OBJECT_TYPE_NAME) {
+	if (options->flags & DRGN_FORMAT_OBJECT_TYPE_NAME) {
 		if (!string_builder_appendc(sb, '('))
 			return &drgn_enomem;
 		err = c_format_type_name_impl(drgn_object_qualified_type(obj),
@@ -1298,7 +1357,7 @@ c_format_pointer_object(const struct drgn_object *obj,
 	if (err)
 		return err;
 
-	if ((flags & DRGN_FORMAT_OBJECT_SYMBOLIZE) &&
+	if ((options->flags & DRGN_FORMAT_OBJECT_SYMBOLIZE) &&
 	    (err = drgn_program_find_symbol_by_address_internal(drgn_object_program(obj),
 								uvalue, &sym)))
 		return err;
@@ -1336,9 +1395,13 @@ c_format_pointer_object(const struct drgn_object *obj,
 		if (__builtin_sub_overflow(one_line_columns, sb->len - start,
 					   &one_line_columns))
 			one_line_columns = 0;
+		struct drgn_format_object_options dereferenced_options =
+			*options;
+		dereferenced_options.flags =
+			drgn_passthrough_format_object_flags(dereferenced_options.flags);
 		err = c_format_object_impl(&dereferenced, indent,
 					   one_line_columns, multi_line_columns,
-					   passthrough_flags, sb);
+					   &dereferenced_options, sb);
 	}
 	if (!err || (err->code != DRGN_ERROR_FAULT && err->code != DRGN_ERROR_OUT_OF_BOUNDS)) {
 		/* We either succeeded or hit a fatal error. */
@@ -1369,13 +1432,12 @@ struct array_initializer_iter {
 	struct drgn_qualified_type element_type;
 	uint64_t element_bit_size;
 	uint64_t length, i;
-	enum drgn_format_object_flags flags, element_flags;
+	enum drgn_format_object_flags flags;
 };
 
 static struct drgn_error *
 array_initializer_iter_next(struct initializer_iter *iter_,
-			    struct drgn_object *obj_ret,
-			    enum drgn_format_object_flags *flags_ret)
+			    struct drgn_object *ret)
 {
 	struct drgn_error *err;
 	struct array_initializer_iter *iter =
@@ -1386,10 +1448,8 @@ array_initializer_iter_next(struct initializer_iter *iter_,
 
 		if (iter->i >= iter->length)
 			return &drgn_stop;
-		err = drgn_object_fragment(obj_ret, iter->obj,
-					   iter->element_type,
-					   iter->i * iter->element_bit_size,
-					   0);
+		err = drgn_object_fragment(ret, iter->obj, iter->element_type,
+					   iter->i * iter->element_bit_size, 0);
 		if (err)
 			return err;
 		iter->i++;
@@ -1400,13 +1460,12 @@ array_initializer_iter_next(struct initializer_iter *iter_,
 		    DRGN_FORMAT_OBJECT_ELEMENT_INDICES)
 			break;
 
-		err = drgn_object_is_zero(obj_ret, &zero);
+		err = drgn_object_is_zero(ret, &zero);
 		if (err)
 			return err;
 		if (!zero)
 			break;
 	}
-	*flags_ret = iter->element_flags;
 	return NULL;
 }
 
@@ -1434,7 +1493,7 @@ static struct drgn_error *
 c_format_array_object(const struct drgn_object *obj,
 		      struct drgn_type *underlying_type, size_t indent,
 		      size_t one_line_columns, size_t multi_line_columns,
-		      enum drgn_format_object_flags flags,
+		      const struct drgn_format_object_options *options,
 		      struct string_builder *sb)
 {
 	struct drgn_error *err;
@@ -1443,17 +1502,16 @@ c_format_array_object(const struct drgn_object *obj,
 			.next = array_initializer_iter_next,
 			.reset = array_initializer_iter_reset,
 			.append_designation =
-				flags & DRGN_FORMAT_OBJECT_ELEMENT_INDICES ?
-				array_initializer_append_designation : NULL,
+				options->flags & DRGN_FORMAT_OBJECT_ELEMENT_INDICES
+				? array_initializer_append_designation : NULL,
 		},
 		.obj = obj,
 		.element_type = drgn_type_type(underlying_type),
 		.length = drgn_type_length(underlying_type),
-		.flags = flags,
-		.element_flags = drgn_element_format_object_flags(flags),
+		.flags = options->flags,
 	};
 
-	if ((flags & DRGN_FORMAT_OBJECT_STRING) && iter.length &&
+	if ((options->flags & DRGN_FORMAT_OBJECT_STRING) && iter.length &&
 	    is_character_type(iter.element_type.type)) {
 		SWITCH_ENUM(obj->kind) {
 		case DRGN_OBJECT_VALUE: {
@@ -1495,9 +1553,9 @@ c_format_array_object(const struct drgn_object *obj,
 	 * including indices, then we'll skip past zeroes as we iterate, so we
 	 * don't need to do this.
 	 */
-	if (!(flags & (DRGN_FORMAT_OBJECT_ELEMENT_INDICES |
-		       DRGN_FORMAT_OBJECT_IMPLICIT_ELEMENTS)) &&
-	    iter.length) {
+	if (!(options->flags & (DRGN_FORMAT_OBJECT_ELEMENT_INDICES
+				| DRGN_FORMAT_OBJECT_IMPLICIT_ELEMENTS))
+	    && iter.length) {
 		DRGN_OBJECT(element, drgn_object_program(obj));
 		do {
 			bool zero;
@@ -1519,10 +1577,13 @@ c_format_array_object(const struct drgn_object *obj,
 				break;
 		} while (iter.length);
 	}
+	struct drgn_format_object_options initializer_options = *options;
+	initializer_options.flags =
+		drgn_element_format_object_flags(initializer_options.flags);
 	return c_format_initializer(drgn_object_program(obj), &iter.iter,
 				    indent, one_line_columns,
-				    multi_line_columns,
-				    flags & DRGN_FORMAT_OBJECT_ELEMENTS_SAME_LINE,
+				    multi_line_columns, &initializer_options,
+				    options->flags & DRGN_FORMAT_OBJECT_ELEMENTS_SAME_LINE,
 				    sb);
 }
 
@@ -1549,10 +1610,11 @@ static const char *drgn_absence_reason_str(enum drgn_absence_reason reason)
 	}
 }
 
+// Note: this ignores options->columns in favor of {one,multi}_line_columns.
 static struct drgn_error *
 c_format_object_impl(const struct drgn_object *obj, size_t indent,
 		     size_t one_line_columns, size_t multi_line_columns,
-		     enum drgn_format_object_flags flags,
+		     const struct drgn_format_object_options *options,
 		     struct string_builder *sb)
 {
 	struct drgn_error *err;
@@ -1566,10 +1628,10 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	    obj->kind != DRGN_OBJECT_ABSENT) {
 		return c_format_pointer_object(obj, underlying_type, indent,
 					       one_line_columns,
-					       multi_line_columns, flags, sb);
+					       multi_line_columns, options, sb);
 	}
 
-	if (flags & DRGN_FORMAT_OBJECT_TYPE_NAME) {
+	if (options->flags & DRGN_FORMAT_OBJECT_TYPE_NAME) {
 		size_t old_len = sb->len;
 
 		if (!string_builder_appendc(sb, '('))
@@ -1599,7 +1661,7 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 					 "cannot format void object");
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
-		return c_format_int_object(obj, flags, sb);
+		return c_format_int_object(obj, options, sb);
 	case DRGN_TYPE_FLOAT:
 		return c_format_float_object(obj, sb);
 	case DRGN_TYPE_STRUCT:
@@ -1607,13 +1669,14 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	case DRGN_TYPE_CLASS:
 		return c_format_compound_object(obj, underlying_type, indent,
 						one_line_columns,
-						multi_line_columns, flags, sb);
+						multi_line_columns, options,
+						sb);
 	case DRGN_TYPE_ENUM:
 		return c_format_enum_object(obj, underlying_type, sb);
 	case DRGN_TYPE_ARRAY:
 		return c_format_array_object(obj, underlying_type, indent,
 					     one_line_columns,
-					     multi_line_columns, flags, sb);
+					     multi_line_columns, options, sb);
 	case DRGN_TYPE_FUNCTION:
 		return c_format_function_object(obj, sb);
 	case DRGN_TYPE_TYPEDEF:
@@ -1623,15 +1686,15 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	}
 }
 
-static struct drgn_error *c_format_object(const struct drgn_object *obj,
-					  size_t columns,
-					  enum drgn_format_object_flags flags,
-					  char **ret)
+static struct drgn_error *
+c_format_object(const struct drgn_object *obj,
+		const struct drgn_format_object_options *options, char **ret)
 {
 	struct drgn_error *err;
 	STRING_BUILDER(sb);
-	err = c_format_object_impl(obj, 0, columns, max(columns, (size_t)1),
-				   flags, &sb);
+	err = c_format_object_impl(obj, 0, options->columns,
+				   max(options->columns, (size_t)1), options,
+				   &sb);
 	if (err)
 		return err;
 	if (!string_builder_null_terminate(&sb))
@@ -2046,21 +2109,18 @@ static const enum drgn_primitive_type specifier_kind[NUM_SPECIFIER_STATES] = {
 enum drgn_primitive_type c_parse_specifier_list(const char *s)
 {
 	struct drgn_error *err;
-	struct drgn_c_family_lexer c_family_lexer;
+
+	DRGN_C_FAMILY_LEXER(c_family_lexer, s, false);
 	struct drgn_lexer *lexer = &c_family_lexer.lexer;
+
 	enum c_type_specifier specifier = SPECIFIER_NONE;
-	enum drgn_primitive_type primitive = DRGN_NOT_PRIMITIVE_TYPE;
-
-	c_family_lexer.cpp = false;
-	drgn_lexer_init(lexer, drgn_c_family_lexer_func, s);
-
 	for (;;) {
 		struct drgn_token token;
 
 		err = drgn_lexer_pop(lexer, &token);
 		if (err) {
 			drgn_error_destroy(err);
-			goto out;
+			return DRGN_NOT_PRIMITIVE_TYPE;
 		}
 
 		if (MIN_SPECIFIER_TOKEN <= token.kind &&
@@ -2071,13 +2131,9 @@ enum drgn_primitive_type c_parse_specifier_list(const char *s)
 		else
 			specifier = SPECIFIER_ERROR;
 		if (specifier == SPECIFIER_ERROR)
-			goto out;
+			return DRGN_NOT_PRIMITIVE_TYPE;
 	}
-
-	primitive = specifier_kind[specifier];
-out:
-	drgn_lexer_deinit(lexer);
-	return primitive;
+	return specifier_kind[specifier];
 }
 
 
@@ -2546,20 +2602,18 @@ static struct drgn_error *c_family_find_type(const struct drgn_language *lang,
 					     struct drgn_qualified_type *ret)
 {
 	struct drgn_error *err;
-	struct drgn_c_family_lexer c_family_lexer;
-	struct drgn_lexer *lexer = &c_family_lexer.lexer;
-	struct drgn_token token;
 
-	c_family_lexer.cpp = lang == &drgn_language_cpp;
-	drgn_lexer_init(lexer, drgn_c_family_lexer_func, name);
+	DRGN_C_FAMILY_LEXER(c_family_lexer, name, lang == &drgn_language_cpp);
+	struct drgn_lexer *lexer = &c_family_lexer.lexer;
 
 	err = c_parse_specifier_qualifier_list(prog, lexer, filename, ret);
 	if (err)
-		goto out;
+		return err;
 
+	struct drgn_token token;
 	err = drgn_lexer_pop(lexer, &token);
 	if (err)
-		goto out;
+		return err;
 	if (token.kind != C_TOKEN_EOF) {
 		struct c_declarator *outer = NULL, *inner;
 
@@ -2576,105 +2630,108 @@ static struct drgn_error *c_family_find_type(const struct drgn_language *lang,
 				free(outer);
 				outer = next;
 			}
-			goto out;
+			return err;
 		}
 
 		err = c_type_from_declarator(prog, outer, ret);
 		if (err)
-			goto out;
+			return err;
 
 		err = drgn_lexer_pop(lexer, &token);
 		if (err)
-			goto out;
+			return err;
 		if (token.kind != C_TOKEN_EOF) {
-			err = drgn_error_create(DRGN_ERROR_SYNTAX,
-						"extra tokens after type name");
-			goto out;
+			return drgn_error_create(DRGN_ERROR_SYNTAX,
+						 "extra tokens after type name");
 		}
 	}
 
-	err = NULL;
-out:
-	drgn_lexer_deinit(lexer);
-	return err;
+	return NULL;
 }
 
-static struct drgn_error *c_family_bit_offset(struct drgn_program *prog,
-					      struct drgn_type *type,
-					      const char *member_designator,
-					      uint64_t *ret)
+static struct drgn_error *
+c_family_type_subobject(struct drgn_type *type, const char *designator,
+			bool expect_member,
+			struct drgn_qualified_type *type_ret,
+			uint64_t *bit_offset_ret, uint64_t *bit_field_size_ret)
 {
 	struct drgn_error *err;
-	struct drgn_c_family_lexer c_family_lexer;
+	struct drgn_program *prog = drgn_type_program(type);
+
+	DRGN_C_FAMILY_LEXER(c_family_lexer, designator,
+			    prog->lang == &drgn_language_cpp);
 	struct drgn_lexer *lexer = &c_family_lexer.lexer;
-	int state = INT_MIN;
+
+	struct drgn_qualified_type qualified_type = { type };
+	uint64_t bit_field_size = 0;
+	enum {
+		START_ANY = INT_MIN,
+		START_MEMBER,
+	};
+	int state = expect_member ? START_MEMBER : START_ANY;
 	uint64_t bit_offset = 0;
-
-	c_family_lexer.cpp = prog->lang == &drgn_language_cpp;
-	drgn_lexer_init(lexer, drgn_c_family_lexer_func, member_designator);
-
 	for (;;) {
 		struct drgn_token token;
-
 		err = drgn_lexer_pop(lexer, &token);
 		if (err)
-			goto out;
+			return err;
 
 		switch (state) {
-		case INT_MIN:
+		case START_ANY:
+		case START_MEMBER:
 		case C_TOKEN_DOT:
 			if (token.kind == C_TOKEN_IDENTIFIER) {
 				struct drgn_type_member *member;
 				uint64_t member_bit_offset;
-				err = drgn_type_find_member_len(type,
+				err = drgn_type_find_member_len(qualified_type.type,
 								token.value,
 								token.len,
 								&member,
 								&member_bit_offset);
 				if (err)
-					goto out;
+					return err;
 				if (__builtin_add_overflow(bit_offset,
 							   member_bit_offset,
 							   &bit_offset)) {
-					err = drgn_error_create(DRGN_ERROR_OVERFLOW,
-								"offset is too large");
-					goto out;
+					return drgn_error_create(DRGN_ERROR_OVERFLOW,
+								 "offset is too large");
 				}
-				struct drgn_qualified_type member_type;
-				err = drgn_member_type(member, &member_type,
-						       NULL);
+				err = drgn_member_type(member, &qualified_type,
+						       &bit_field_size);
 				if (err)
-					goto out;
-				type = member_type.type;
+					return err;
 			} else if (state == C_TOKEN_DOT) {
-				err = drgn_error_create(DRGN_ERROR_SYNTAX,
-							"expected identifier after '.'");
-				goto out;
-			} else {
-				err = drgn_error_create(DRGN_ERROR_SYNTAX,
-							"expected identifier");
-				goto out;
+				return drgn_error_create(DRGN_ERROR_SYNTAX,
+							 "expected identifier after '.'");
+			} else if (state == START_MEMBER) {
+				return drgn_error_create(DRGN_ERROR_SYNTAX,
+							 "expected identifier");
+			} else if (token.kind != C_TOKEN_LBRACKET) {
+				return drgn_error_create(DRGN_ERROR_SYNTAX,
+							 "expected identifier or '['");
 			}
 			break;
 		case C_TOKEN_IDENTIFIER:
 		case C_TOKEN_RBRACKET:
 			switch (token.kind) {
 			case C_TOKEN_EOF:
-				*ret = bit_offset;
-				err = NULL;
-				goto out;
+				if (type_ret)
+					*type_ret = qualified_type;
+				if (bit_offset_ret)
+					*bit_offset_ret = bit_offset;
+				if (bit_field_size_ret)
+					*bit_field_size_ret = bit_field_size;
+				return NULL;
 			case C_TOKEN_DOT:
 			case C_TOKEN_LBRACKET:
 				break;
 			default:
 				if (state == C_TOKEN_IDENTIFIER) {
-					err = drgn_error_create(DRGN_ERROR_SYNTAX,
-								"expected '.' or '[' after identifier");
-					goto out;
+					return drgn_error_create(DRGN_ERROR_SYNTAX,
+								 "expected '.' or '[' after identifier");
 				} else {
-					err = drgn_error_create(DRGN_ERROR_SYNTAX,
-								"expected '.' or '[' after ']'");
-					goto out;
+					return drgn_error_create(DRGN_ERROR_SYNTAX,
+								 "expected '.' or '[' after ']'");
 				}
 			}
 			break;
@@ -2686,41 +2743,38 @@ static struct drgn_error *c_family_bit_offset(struct drgn_program *prog,
 
 				err = c_token_to_u64(&token, &index);
 				if (err)
-					goto out;
+					return err;
 
-				underlying_type = drgn_underlying_type(type);
+				underlying_type = drgn_underlying_type(qualified_type.type);
 				if (drgn_type_kind(underlying_type) != DRGN_TYPE_ARRAY) {
-					err = drgn_type_error("'%s' is not an array",
-							      type);
-					goto out;
+					return drgn_type_error("'%s' is not an array",
+							       qualified_type.type);
 				}
 				element_type =
 					drgn_type_type(underlying_type).type;
 				err = drgn_type_bit_size(element_type,
 							 &bit_size);
 				if (err)
-					goto out;
+					return err;
 				if (__builtin_mul_overflow(index, bit_size,
 							   &element_offset) ||
 				    __builtin_add_overflow(bit_offset,
 							   element_offset,
 							   &bit_offset)) {
-					err = drgn_error_create(DRGN_ERROR_OVERFLOW,
-								"offset is too large");
-					goto out;
+					return drgn_error_create(DRGN_ERROR_OVERFLOW,
+								 "offset is too large");
 				}
-				type = element_type;
+				qualified_type = (struct drgn_qualified_type){ element_type };
+				bit_field_size = 0;
 			} else {
-				err = drgn_error_create(DRGN_ERROR_SYNTAX,
-							"expected number after '['");
-				goto out;
+				return drgn_error_create(DRGN_ERROR_SYNTAX,
+							 "expected number after '['");
 			}
 			break;
 		case C_TOKEN_NUMBER:
 			if (token.kind != C_TOKEN_RBRACKET) {
-				err = drgn_error_create(DRGN_ERROR_SYNTAX,
-							"expected ']' after number");
-				goto out;
+				return drgn_error_create(DRGN_ERROR_SYNTAX,
+							 "expected ']' after number");
 			}
 			break;
 		default:
@@ -2728,10 +2782,6 @@ static struct drgn_error *c_family_bit_offset(struct drgn_program *prog,
 		}
 		state = token.kind;
 	}
-
-out:
-	drgn_lexer_deinit(lexer);
-	return err;
 }
 
 static struct drgn_error *c_integer_literal(struct drgn_object *res,
@@ -3825,9 +3875,10 @@ LIBDRGN_PUBLIC const struct drgn_language drgn_language_c = {
 	.has_namespaces = false,
 	.format_type_name = c_format_type_name,
 	.format_type = c_format_type,
+	.format_variable_declaration = c_format_variable_declaration,
 	.format_object = c_format_object,
 	.find_type = c_family_find_type,
-	.bit_offset = c_family_bit_offset,
+	.type_subobject = c_family_type_subobject,
 	.integer_literal = c_integer_literal,
 	.bool_literal = c_bool_literal,
 	.float_literal = c_float_literal,
@@ -3856,9 +3907,10 @@ LIBDRGN_PUBLIC const struct drgn_language drgn_language_cpp = {
 	.has_namespaces = true,
 	.format_type_name = c_format_type_name,
 	.format_type = c_format_type,
+	.format_variable_declaration = c_format_variable_declaration,
 	.format_object = c_format_object,
 	.find_type = c_family_find_type,
-	.bit_offset = c_family_bit_offset,
+	.type_subobject = c_family_type_subobject,
 	.integer_literal = c_integer_literal,
 	.bool_literal = c_bool_literal,
 	.float_literal = c_float_literal,

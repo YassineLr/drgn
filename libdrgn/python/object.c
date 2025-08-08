@@ -909,10 +909,8 @@ static PyObject *DrgnObject_repr(DrgnObject *self)
 
 static PyObject *DrgnObject_str(DrgnObject *self)
 {
-	struct drgn_error *err;
 	_cleanup_free_ char *str = NULL;
-	err = drgn_format_object(&self->obj, SIZE_MAX,
-				 DRGN_FORMAT_OBJECT_PRETTY, &str);
+	struct drgn_error *err = drgn_format_object(&self->obj, NULL, &str);
 	if (err)
 		return set_drgn_error(err);
 	return PyUnicode_FromString(str);
@@ -963,14 +961,19 @@ static PyObject *DrgnObject_format(DrgnObject *self, PyObject *args,
 		FLAGS
 #undef X
 		"columns",
+		"integer_base",
 		NULL,
 	};
 	struct drgn_error *err;
 	PyObject *columns_obj = Py_None;
-	size_t columns = SIZE_MAX;
-	enum drgn_format_object_flags flags = DRGN_FORMAT_OBJECT_PRETTY;
+	PyObject *integer_base_obj = Py_None;
+	struct drgn_format_object_options options = {
+		.columns = SIZE_MAX,
+		.flags = DRGN_FORMAT_OBJECT_PRETTY,
+		.integer_base = 10,
+	};
 #define X(name, value)	\
-	struct format_object_flag_arg name##_arg = { &flags, value };
+	struct format_object_flag_arg name##_arg = { &options.flags, value };
 	FLAGS
 #undef X
 
@@ -978,25 +981,40 @@ static PyObject *DrgnObject_format(DrgnObject *self, PyObject *args,
 #define X(name, value) "O&"
 					 FLAGS
 #undef X
-					 "O:format_", keywords,
+					 "OO:format_", keywords,
 #define X(name, value) format_object_flag_converter, &name##_arg,
 					 FLAGS
 #undef X
-					 &columns_obj))
+					 &columns_obj, &integer_base_obj))
 		return NULL;
 
 	if (columns_obj != Py_None) {
 		columns_obj = PyNumber_Index(columns_obj);
 		if (!columns_obj)
 			return NULL;
-		columns = PyLong_AsSize_t(columns_obj);
+		options.columns = PyLong_AsSize_t(columns_obj);
 		Py_DECREF(columns_obj);
-		if (columns == (size_t)-1 && PyErr_Occurred())
+		if (options.columns == (size_t)-1 && PyErr_Occurred())
 			return NULL;
 	}
 
+	if (integer_base_obj != Py_None) {
+		int overflow;
+		long integer_base = PyLong_AsLongAndOverflow(integer_base_obj,
+							     &overflow);
+		if (integer_base == -1 && PyErr_Occurred())
+			return NULL;
+		if (overflow
+		    || integer_base < INT_MIN || integer_base > INT_MAX) {
+			PyErr_SetString(PyExc_ValueError,
+					"invalid integer base");
+			return NULL;
+		}
+		options.integer_base = integer_base;
+	}
+
 	_cleanup_free_ char *str = NULL;
-	err = drgn_format_object(&self->obj, columns, flags, &str);
+	err = drgn_format_object(&self->obj, &options, &str);
 	if (err)
 		return set_drgn_error(err);
 	return PyUnicode_FromString(str);
@@ -1360,6 +1378,26 @@ static DrgnObject *DrgnObject_member(DrgnObject *self, PyObject *args,
 	return_ptr(res);
 }
 
+static DrgnObject *DrgnObject_subobject(DrgnObject *self, PyObject *args,
+					PyObject *kwds)
+{
+	static char *keywords[] = {"designator", NULL};
+	struct drgn_error *err;
+	const char *designator;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s:subobject_", keywords,
+					 &designator))
+		return NULL;
+
+	_cleanup_pydecref_ DrgnObject *res =
+		DrgnObject_alloc(DrgnObject_prog(self));
+	if (!res)
+		return NULL;
+	err = drgn_object_subobject(&res->obj, &self->obj, designator);
+	if (err)
+		return set_drgn_error(err);
+	return_ptr(res);
+}
+
 static PyObject *DrgnObject_getattro(DrgnObject *self, PyObject *attr_name)
 {
 	struct drgn_error *err;
@@ -1434,13 +1472,79 @@ static DrgnObject *DrgnObject_subscript_impl(DrgnObject *self,
 	return_ptr(res);
 }
 
-static DrgnObject *DrgnObject_subscript(DrgnObject *self, PyObject *key)
+static int64_t index_to_int64(PyObject *number)
 {
-	struct index_arg index = { .is_signed = true };
+	_cleanup_pydecref_ PyObject *index = PyNumber_Index(number);
+	if (!index)
+		return -1;
+	return PyLong_AsInt64(index);
+}
 
-	if (!index_converter(key, &index))
+static DrgnObject *DrgnObject_subscript(DrgnObject *self, PyObject *item)
+{
+	if (PyIndex_Check(item)) {
+		int64_t index = index_to_int64(item);
+		if (index == -1 && PyErr_Occurred())
+			return NULL;
+		return DrgnObject_subscript_impl(self, index);
+	} else if (PySlice_Check(item)) {
+		PySliceObject *slice = (PySliceObject *)item;
+		Py_ssize_t start, stop;
+		if (slice->start == Py_None) {
+			start = 0;
+		} else {
+			start = index_to_int64(slice->start);
+			if (start == -1 && PyErr_Occurred())
+				return NULL;
+		}
+		if (slice->stop == Py_None) {
+			struct drgn_type *underlying_type =
+				drgn_underlying_type(self->obj.type);
+			if (drgn_type_kind(underlying_type) != DRGN_TYPE_ARRAY
+			    || !drgn_type_is_complete(underlying_type)) {
+				set_error_type_name("'%s' has no length; slice stop must be given",
+						    drgn_object_qualified_type(&self->obj));
+				return NULL;
+			}
+			uint64_t length = drgn_type_length(underlying_type);
+			if (length > INT64_MAX) {
+				PyErr_SetString(PyExc_OverflowError,
+						"length is too large");
+				return NULL;
+			}
+			stop = length;
+		} else {
+			stop = index_to_int64(slice->stop);
+			if (stop == -1 && PyErr_Occurred())
+				return NULL;
+		}
+		if (slice->step != Py_None) {
+			Py_ssize_t step =
+				PyNumber_AsSsize_t(slice->step,
+						   PyExc_OverflowError);
+			if (step == -1 && PyErr_Occurred())
+				return NULL;
+			if (step != 1) {
+				PyErr_SetString(PyExc_ValueError,
+						"object slice step must be 1");
+				return NULL;
+			}
+		}
+		struct drgn_error *err;
+		_cleanup_pydecref_ DrgnObject *res =
+			DrgnObject_alloc(DrgnObject_prog(self));
+		if (!res)
+			return NULL;
+		err = drgn_object_slice(&res->obj, &self->obj, start, stop);
+		if (err)
+			return set_drgn_error(err);
+		return_ptr(res);
+	} else {
+		PyErr_Format(PyExc_TypeError,
+			     "object subscript must be integer or slice, not %.200s",
+			     Py_TYPE(item)->tp_name);
 		return NULL;
-	return DrgnObject_subscript_impl(self, index.svalue);
+	}
 }
 
 static ObjectIterator *DrgnObject_iter(DrgnObject *self)
@@ -1545,6 +1649,8 @@ static PyMethodDef DrgnObject_methods[] = {
 	 drgn_Object_string__DOC},
 	{"member_", (PyCFunction)DrgnObject_member,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Object_member__DOC},
+	{"subobject_", (PyCFunction)DrgnObject_subobject,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Object_subobject__DOC},
 	{"address_of_", (PyCFunction)DrgnObject_address_of, METH_NOARGS,
 	 drgn_Object_address_of__DOC},
 	{"read_", (PyCFunction)DrgnObject_read, METH_NOARGS,

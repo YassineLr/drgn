@@ -3,25 +3,32 @@
 
 """Functions for porting commands from :doc:`crash <crash_compatibility>`."""
 
-import collections
 import contextlib
+import dataclasses
 import os
 import re
 import shutil
 import subprocess
 import sys
-from typing import Any, List, Literal, Optional, Tuple
+import textwrap
+from typing import Any, FrozenSet, List, Literal, Optional, Set, Tuple
 
 from _drgn_util.typingutils import copy_func_params
-from drgn import Object, Program, ProgramFlags
+from drgn import Object, Program, ProgramFlags, Type, TypeKind
 from drgn.commands import (
+    _SHELL_TOKEN_REGEX,
     CommandFuncDecorator,
     CommandNamespace,
+    CommandNotFoundError,
     CustomCommandFuncDecorator,
+    DrgnCodeBuilder,
+    _unquote,
     command,
     custom_command,
 )
+from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.pid import find_task
+from drgn.helpers.linux.sched import task_cpu
 
 
 def _pid_or_task(s: str) -> Tuple[Literal["pid", "task"], int]:
@@ -29,6 +36,36 @@ def _pid_or_task(s: str) -> Tuple[Literal["pid", "task"], int]:
         return "pid", int(s)
     except ValueError:
         return "task", int(s, 16)
+
+
+def _guess_type(prog: Program, kind: str, name: str) -> Type:
+    if kind != "union":
+        try:
+            return prog.type("struct " + name)
+        except LookupError:
+            pass
+
+    if kind != "struct":
+        try:
+            return prog.type("union " + name)
+        except LookupError:
+            pass
+
+    # Try a typedef.
+    type = prog.type(name)
+
+    # Make sure it's a typedef of our desired type kind.
+    underlying_type = type
+    while underlying_type.kind == TypeKind.TYPEDEF:
+        underlying_type = underlying_type.type
+    if (kind != "union" and underlying_type.kind == TypeKind.STRUCT) or (
+        kind != "struct" and underlying_type.kind == TypeKind.UNION
+    ):
+        return type
+
+    if kind == "*":
+        kind = "struct or union"
+    raise LookupError(f"{type.type_name()} is not a {kind}")
 
 
 def _find_pager(which: Optional[str] = None) -> Optional[List[str]]:
@@ -61,12 +98,43 @@ class _CrashCommandNamespace(CommandNamespace):
             argparse_types=(("pid_or_task", _pid_or_task),),
         )
 
-    def split_command(self, command: str) -> Tuple[str, str]:
-        # '*' and '!' may be combined with their first argument.
-        match = re.fullmatch(r"\s*([!*])\s*(.*)", command)
-        if match:
-            return match.group(1), match.group(2)
-        return super().split_command(command)
+    def _run(self, prog: Program, command: str, **kwargs: Any) -> Any:
+        command = command.lstrip()
+        if command.startswith("!"):
+            args = command[1:].lstrip()
+            if args:
+                return subprocess.call(["sh", "-c", "--", args])
+            else:
+                return subprocess.call(["sh", "-i"])
+
+        if command.startswith("*"):
+            command_name = "*"
+            command_obj = self.lookup(prog, "*")
+            args = command[1:].lstrip()
+        else:
+            match = _SHELL_TOKEN_REGEX.match(command)
+            if not match or match.lastgroup != "WORD":
+                raise SyntaxError("expected command name")
+
+            command_name = _unquote(match.group())
+            try:
+                command_obj = self.lookup(prog, command_name)
+            except CommandNotFoundError as e:
+                try:
+                    # Smuggle the type into the command function.
+                    kwargs["type"] = _guess_type(
+                        prog, "*", command_name.partition(".")[0]
+                    )
+                except LookupError:
+                    raise e
+                else:
+                    command_name = "*"
+                    command_obj = self.lookup(prog, "*")
+                    args = command
+            else:
+                args = command[match.end() :].lstrip()
+
+        return command_obj.run(prog, command_name, args, **kwargs)
 
     def run(self, prog: Program, command: str, **kwargs: Any) -> Any:
         if prog.config.get("crash_scroll", True):
@@ -162,193 +230,164 @@ def crash_get_context(
     return task
 
 
-def _merge_imports(*sources: str) -> str:
-    # Combine multiple strings of Python source code into one, merging and
-    # sorting their imports (which must be at the beginning of each string).
-    imports = collections.defaultdict(set)
-    other_parts: List[str] = []
+@dataclasses.dataclass(frozen=True)
+class Cpuspec:
+    """Parsed crash CPU specifier."""
 
-    for source in sources:
-        for match in re.finditer(
-            r"""
-            (?P<import>
-                ^\s*
-                import
-                [^\S\n]+
-                (?P<import_modules>
-                    [\w.]+
-                    (?:\s*,\s*[\w.]+)*
-                )
-                \s*$\n?
-            )
-            |
-            (?P<from_import>
-                ^\s*
-                from
-                [^\S\n]+
-                (?P<from_import_module>[\w.]+)
-                [^\S\n]+
-                import
-                (?:
-                    [^\S\n]+
-                    (?P<from_import_names>
-                        \w+
-                        (?:[^\S\n]*,[^\S\n]*\w+)*
-                    )
-                    |
-                    [^\S\n]*
-                    \(
-                    \s*
-                    (?P<from_import_names_in_parens>
-                        \w+
-                        (?:\s*,\s*\w+)*
-                        (?:\s*,)?
-                    )
-                    \s*
-                    \)
-                )
-                \s*$\n?
-            )
-            |
-            (?P<rest>(?s:.+))
-            """,
-            source,
-            flags=re.MULTILINE | re.VERBOSE,
-        ):
-            if match.lastgroup == "import":
-                for module in match.group("import_modules").split(","):
-                    imports[module.strip()].add("")
-            elif match.lastgroup == "from_import":
-                module = imports[match.group("from_import_module")]
-                for name in (
-                    match.group("from_import_names")
-                    or match.group("from_import_names_in_parens")
-                ).split(","):
-                    name = name.strip()
-                    if not name:
-                        continue
-                    module.add(name)
-            else:
-                rest = match.group("rest")
-                if rest:
-                    if other_parts:
-                        other_parts.append("\n")
-                    other_parts.append(rest)
+    current: bool = False
+    """Include the CPU of the current context."""
 
-    parts: List[str] = []
-    first_party_imports: List[str] = []
-    for module, names in sorted(imports.items()):
-        if module == "drgn" or module.startswith("drgn."):
-            target = first_party_imports
+    all: bool = False
+    """Include all possible CPUs."""
+
+    explicit_cpus: FrozenSet[int] = frozenset()
+    """Explicitly listed CPUs."""
+
+    def __post_init__(self) -> None:
+        if self.current + self.all + bool(self.explicit_cpus) > 1:
+            raise ValueError(
+                "at most one of current, all, or explicit_cpus may be given"
+            )
+
+    def cpus(self, prog: Program) -> List[int]:
+        """
+        Resolve the CPU specifier to a sorted list of CPU numbers, checking
+        that all given CPUs were valid.
+        """
+        if self.current:
+            return [task_cpu(crash_get_context(prog))]
+        elif self.all:
+            return sorted(for_each_possible_cpu(prog))
+        elif self.explicit_cpus:
+            possible = set(for_each_possible_cpu(prog))
+            if not self.explicit_cpus.issubset(possible):
+                raise ValueError(f"invalid CPUs: {self.explicit_cpus - possible}")
+            return sorted(self.explicit_cpus)
         else:
-            target = parts
-
-        if "" in names:
-            names.remove("")
-            target.append(f"import {module}\n")
-
-        if names:
-            sorted_names = sorted(names)
-            line = f"from {module} import {', '.join(sorted_names)}\n"
-            # 88 (the default Black line length) + 1 for the newline.
-            if len(line) <= 89:
-                target.append(line)
-            else:
-                target.append(f"from {module} import (\n")
-                for name in sorted_names:
-                    target.append(f"    {name},\n")
-                target.append(")\n")
-
-    if parts and first_party_imports:
-        parts.append("\n")
-    parts.extend(first_party_imports)
-
-    if parts and other_parts:
-        parts.append("\n\n")
-    parts.extend(other_parts)
-
-    return "".join(parts)
+            return []
 
 
-def _add_context(source: str, context: str) -> str:
-    if not source:
-        return context
+def parse_cpuspec(spec: str) -> Cpuspec:
+    """
+    Parse a crash CPU specifier.
 
-    return _merge_imports(context, source)
+    A CPU specifier may be a comma-separated string of CPU numbers or ranges
+    (e.g., '0,3-4'), 'a' or 'all' (meaning all possible CPUs), or an empty
+    string (meaning the CPU of the current context).
+    """
+    if not spec:
+        return Cpuspec(current=True)
 
+    # Crash's parser is much more permissive: it allows extra commas (e.g.,
+    # 0,,1,), extra hyphens (e.g., 0-1-2,-3--4-), and mixing "all" with CPU
+    # numbers (e.g., 0-1,all). We chose to be stricter, but we can loosen it if
+    # requested.
+    if spec == "a" or spec == "all":
+        return Cpuspec(all=True)
 
-def _add_crash_panic_context(prog: Program, source: str) -> str:
-    if (prog.flags & (ProgramFlags.IS_LIVE | ProgramFlags.IS_LOCAL)) == (
-        ProgramFlags.IS_LIVE | ProgramFlags.IS_LOCAL
-    ):
-        context = """\
-import os
-
-from drgn.helpers.linux.pid import find_task
-
-
-task = find_task(os.getpid())
-"""
-    else:
-        context = """\
-from drgn.helpers.linux.panic import panic_task
-
-
-task = panic_task()
-"""
-    return _add_context(source, context)
-
-
-def _add_crash_cpu_context(source: str, cpu: int) -> str:
-    return _add_context(
-        source,
-        f"""\
-from drgn.helpers.linux.sched import cpu_curr
+    cpus: Set[int] = set()
+    for part in spec.split(","):
+        match = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", part)
+        if not match:
+            raise ValueError(f"invalid cpuspec: {spec}") from None
+        if match.group(2):
+            cpus.update(range(int(match.group(1)), int(match.group(2)) + 1))
+        else:
+            cpus.add(int(match.group(1)))
+    return Cpuspec(explicit_cpus=frozenset(cpus))
 
 
+class CrashDrgnCodeBuilder(DrgnCodeBuilder):
+    """
+    Helper class for generating code for :func:`drgn_argument` for crash
+    commands.
+    """
+
+    def __init__(self, prog: Program) -> None:
+        super().__init__()
+        self._prog = prog
+
+    def _append_crash_panic_context(self) -> None:
+        if (self._prog.flags & (ProgramFlags.IS_LIVE | ProgramFlags.IS_LOCAL)) == (
+            ProgramFlags.IS_LIVE | ProgramFlags.IS_LOCAL
+        ):
+            self.add_import("os")
+            self.add_from_import("drgn.helpers.linux.pid", "find_task")
+            self.append("task = find_task(os.getpid())\n")
+        else:
+            self.add_from_import("drgn.helpers.linux.panic", "panic_task")
+            self.append("task = panic_task()\n")
+
+    def _append_crash_cpu_context(self, cpu: int) -> None:
+        self.add_from_import("drgn.helpers.linux.sched", "cpu_curr")
+        self.append(
+            f"""\
 cpu = {cpu}
 task = cpu_curr(cpu)
-""",
-    )
+"""
+        )
 
-
-def add_crash_context(
-    prog: Program, source: str, arg: Optional[Tuple[Literal["pid", "task"], int]] = None
-) -> str:
-    """
-    Edit an output string for :func:`drgn_argument` to include code for getting
-    the task context.
-
-    :param arg: Context parsed by the ``"pid_or_task"`` argparse type to use.
-        If ``None`` or not given, use the current context.
-    """
-    if arg is None:
-        arg = prog.config.get("crash_context_origin")
-        if arg is None:
-            return _add_crash_panic_context(prog, source)
-        elif arg[0] == "cpu":
-            return _add_crash_cpu_context(source, arg[1])
-
-    if arg[0] == "pid":
-        return _add_context(
-            source,
+    def _append_crash_pid_context(self, pid: int) -> None:
+        self.add_from_import("drgn.helpers.linux.pid", "find_task")
+        self.append(
             f"""\
-from drgn.helpers.linux.pid import find_task
-
-
-pid = {arg[1]}
+pid = {pid}
 task = find_task(pid)
-""",
+"""
         )
-    else:
-        assert arg[0] == "task"
-        return _add_context(
-            source,
+
+    def _append_crash_task_context(self, address: int) -> None:
+        self.add_from_import("drgn", "Object")
+        self.append(
             f"""\
-from drgn import Object
-
-
-address = {hex(arg[1])}
+address = {hex(address)}
 task = Object(prog, "struct task_struct *", address)
-""",
+"""
         )
+
+    def append_crash_context(
+        self, arg: Optional[Tuple[Literal["pid", "task"], int]] = None
+    ) -> None:
+        """
+        Append code for getting the task context in a variable named ``task``.
+
+        :param arg: Context parsed by the ``"pid_or_task"`` argparse type to
+            use. If ``None`` or not given, use the current context.
+        """
+
+        if arg is None:
+            arg = self._prog.config.get("crash_context_origin")
+            if arg is None:
+                self._append_crash_panic_context()
+                return
+            elif arg[0] == "cpu":
+                self._append_crash_cpu_context(arg[1])
+                return
+
+        if arg[0] == "pid":
+            self._append_crash_pid_context(arg[1])
+        else:
+            assert arg[0] == "task"
+            self._append_crash_task_context(arg[1])
+
+    def append_cpuspec(self, cpuspec: Cpuspec, loop_body: str) -> None:
+        """
+        Append code to be executed for each CPU in a CPU specifier.
+
+        :param cpuspec: CPU specifier parsed by :func:`parse_cpuspec()`.
+        :param loop_body: Code to add for each CPU. Will be indented if
+            needed.
+        """
+        if cpuspec.current:
+            self.add_from_import("drgn.helpers.linux.sched", "task_cpu")
+            self.append_crash_context()
+            self.append("cpu = task_cpu(task)\n")
+            self.append(loop_body)
+            return
+
+        if cpuspec.all:
+            self.add_from_import("drgn.helpers.linux.cpumask", "for_each_possible_cpu")
+            self.append("for cpu in for_each_possible_cpu():\n")
+        else:
+            self.append(f"for cpu in {cpuspec.cpus(self._prog)!r}:\n")
+        self.append(textwrap.indent(loop_body, "    "))

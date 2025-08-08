@@ -590,9 +590,22 @@ static void drgn_test_page_pool_exit(void)
 
 DEFINE_PER_CPU(u32, drgn_test_percpu_static);
 u32 __percpu *drgn_test_percpu_dynamic;
+struct percpu_counter drgn_test_percpu_counter;
+
+struct drgn_test_percpu_struct {
+	int cpu;
+	int i;
+};
+
+DEFINE_PER_CPU(struct drgn_test_percpu_struct, drgn_test_percpu_structs);
+
+typedef struct drgn_test_percpu_struct drgn_test_percpu_array[3];
+
+DEFINE_PER_CPU(drgn_test_percpu_array, drgn_test_percpu_arrays);
 
 static int drgn_test_percpu_init(void)
 {
+	int ret;
 	int cpu;
 	u32 static_seed = drgn_test_prng32_seed("PCPU");
 	u32 dynamic_seed = drgn_test_prng32_seed("pcpu");
@@ -602,16 +615,39 @@ static int drgn_test_percpu_init(void)
 		return -ENOMEM;
 	// Initialize the per-cpu variables with a PRNG sequence.
 	for_each_possible_cpu(cpu) {
+		int i;
+
 		static_seed = drgn_test_prng32(static_seed);
 		per_cpu(drgn_test_percpu_static, cpu) = static_seed;
 		dynamic_seed = drgn_test_prng32(dynamic_seed);
 		*per_cpu_ptr(drgn_test_percpu_dynamic, cpu) = dynamic_seed;
+
+		per_cpu(drgn_test_percpu_structs, cpu) =
+			(struct drgn_test_percpu_struct){
+				.cpu = cpu,
+			};
+
+		for (i = 0; i < 3; i++) {
+			per_cpu(drgn_test_percpu_arrays, cpu)[i] =
+				(struct drgn_test_percpu_struct){
+					.cpu = cpu,
+					.i = i,
+				};
+		}
 	}
+
+	ret = percpu_counter_init(&drgn_test_percpu_counter,
+				  10, GFP_KERNEL);
+	if (ret)
+		return ret;
+	percpu_counter_add(&drgn_test_percpu_counter, 3);
+
 	return 0;
 }
 
 static void drgn_test_percpu_exit(void)
 {
+	percpu_counter_destroy(&drgn_test_percpu_counter);
 	free_percpu(drgn_test_percpu_dynamic);
 }
 
@@ -1616,6 +1652,20 @@ static void drgn_test_sysfs_exit(void)
 static inline int drgn_test_sysfs_init(void) { return 0; }
 static inline void drgn_test_sysfs_exit(void) {}
 #endif
+
+// types
+
+union drgn_test_union {
+	u32 u;
+	s32 s;
+};
+union drgn_test_union drgn_test_union_var;
+
+typedef union {
+	u64 u;
+	s64 s;
+} drgn_test_anonymous_union;
+drgn_test_anonymous_union drgn_test_anonymous_union_var;
 
 static void drgn_test_exit(void)
 {

@@ -3,6 +3,7 @@
 
 import os
 import signal
+import time
 
 from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.pid import find_task
@@ -13,6 +14,7 @@ from drgn.helpers.linux.sched import (
     loadavg,
     task_cpu,
     task_on_cpu,
+    task_since_last_arrival_ns,
     task_state_to_char,
     task_thread_info,
 )
@@ -101,3 +103,9 @@ class TestSched(LinuxKernelTestCase):
         values = loadavg(self.prog)
         self.assertEqual(len(values), 3)
         self.assertTrue(all(v >= 0.0 for v in values))
+
+    def test_task_since_last_arrival_ns(self):
+        with fork_and_stop() as pid:
+            time.sleep(0.01)
+            task = find_task(self.prog, pid)
+            self.assertGreaterEqual(task_since_last_arrival_ns(task), 10000000)

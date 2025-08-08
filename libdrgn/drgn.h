@@ -878,6 +878,14 @@ enum drgn_program_flags drgn_program_flags(struct drgn_program *prog);
  */
 const struct drgn_platform *drgn_program_platform(struct drgn_program *prog);
 
+/**
+ * Get the path of the core dump that a @ref drgn_program was created from.
+ *
+ * @return Path which is valid until the program is destroyed, or @c NULL if the
+ * program was not created from a core dump.
+ */
+const char *drgn_program_core_dump_path(struct drgn_program *prog);
+
 /** Get the default language of a @ref drgn_program. */
 const struct drgn_language *drgn_program_language(struct drgn_program *prog);
 
@@ -2616,7 +2624,7 @@ struct drgn_error *drgn_object_copy(struct drgn_object *res,
 struct drgn_error *drgn_object_fragment(struct drgn_object *res,
 					const struct drgn_object *obj,
 					struct drgn_qualified_type qualified_type,
-					uint64_t bit_offset,
+					int64_t bit_offset,
 					uint64_t bit_field_size);
 
 /**
@@ -2794,6 +2802,22 @@ enum drgn_format_object_flags {
 	DRGN_FORMAT_OBJECT_VALID_FLAGS = (1 << 13) - 1,
 };
 
+/** Formatting options for @ref drgn_format_object(). */
+struct drgn_format_object_options {
+	/**
+	 * Number of columns to limit output to when the expression can be
+	 * reasonably wrapped. The default is @c SIZE_MAX.
+	 */
+	size_t columns;
+	/**
+	 * Flags to control formatting. The default is @ref
+	 * DRGN_FORMAT_OBJECT_PRETTY.
+	 */
+	enum drgn_format_object_flags flags;
+	/** Base to format integers in (8, 10, or 16). The default is 10. */
+	int integer_base;
+};
+
 /**
  * Format a @ref drgn_object as a string.
  *
@@ -2801,17 +2825,15 @@ enum drgn_format_object_flags {
  * language.
  *
  * @param[in] obj Object to format.
- * @param[in] columns Number of columns to limit output to when the expression
- * can be reasonably wrapped.
- * param[in] flags Flags to change output.
+ * @param[in] options Formatting options, or @c NULL to use the default options.
  * @param[out] ret Returned string. On success, it must be freed with @c free().
  * On error, it is not modified.
  * @return @c NULL on success, non-@c NULL on error.
  */
-struct drgn_error *drgn_format_object(const struct drgn_object *obj,
-				      size_t columns,
-				      enum drgn_format_object_flags flags,
-				      char **ret);
+struct drgn_error *
+drgn_format_object(const struct drgn_object *obj,
+		   const struct drgn_format_object_options *options,
+		   char **ret);
 
 /** @} */
 
@@ -3018,6 +3040,22 @@ drgn_object_dereference(struct drgn_object *res, const struct drgn_object *obj)
 }
 
 /**
+ * Slice (i.e., get an array from a range of another array) a @ref drgn_object.
+ *
+ * This is applicable to pointers and arrays.
+ *
+ * @param[out] res Resulting array. May be the same as @p obj.
+ * @param[in] obj Object to slice.
+ * @param[in] start Start index (inclusive).
+ * @param[in] end End index (exclusive).
+ * @return @c NULL on success, non-@c NULL on error. @p res is not modified on
+ * error.
+ */
+struct drgn_error *drgn_object_slice(struct drgn_object *res,
+				     const struct drgn_object *obj,
+				     int64_t start, int64_t end);
+
+/**
  * Get a member of a structure, union, or class @ref drgn_object (@c .).
  *
  * @param[out] res Returned member. May be the same as @p obj.
@@ -3044,6 +3082,20 @@ struct drgn_error *drgn_object_member(struct drgn_object *res,
 struct drgn_error *drgn_object_member_dereference(struct drgn_object *res,
 						  const struct drgn_object *obj,
 						  const char *member_name);
+
+
+/**
+ * Get a subobject (member or element) of this object.
+ *
+ * @param[out] res Returned subobject. May be the same as @p obj.
+ * @param[in] obj Object.
+ * @param[in] designator One or more member references or array subscripts.
+ * @return @c NULL on success, non-@c NULL on error. @p res is not modified on
+ * error.
+ */
+struct drgn_error *drgn_object_subobject(struct drgn_object *res,
+					 const struct drgn_object *obj,
+					 const char *member_designator);
 
 
 /**
@@ -3750,6 +3802,24 @@ drgn_format_type_name(struct drgn_qualified_type qualified_type, char **ret);
  */
 struct drgn_error *drgn_format_type(struct drgn_qualified_type qualified_type,
 				    char **ret);
+
+
+/**
+ * Format a variable declaration with the given type and name.
+ *
+ * This will format the variable as it would be declared in its programming
+ * language.
+ *
+ * @param[in] qualified_type Variable type.
+ * @param[in] name Variable name.
+ * @param[out] ret Returned string. On success, it must be freed with @c free().
+ * On error, it is not modified.
+ * @return @c NULL on success, non-@c NULL on error.
+ */
+struct drgn_error *
+drgn_format_variable_declaration(struct drgn_qualified_type qualified_type,
+				 const char *name, char **ret)
+	__attribute__((__nonnull__(2, 3)));
 
 /** @} */
 
